@@ -6,3 +6,4 @@ ffmpeg/
 __pycache__/
 *.pyc
 *.mp4
+!tests/sample.mp4

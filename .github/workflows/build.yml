@@ -39,7 +39,7 @@ jobs:
       - name: Self test (analyze, auto digest, captions, vertical render)
         shell: pwsh
         run: |
-          $p = Start-Process -PassThru -FilePath "dist\KirinukiTool\KirinukiTool.exe" -ArgumentList "--selftest","tests\sample.mp4","selftest_out"
+          $p = Start-Process -PassThru -FilePath "dist\KirinukiTool\KirinukiTool.exe" -ArgumentList "--selftest","$PWD\tests\sample.mp4","$PWD\selftest_out"
           if (-not $p.WaitForExit(1200000)) { Write-Error "selftest timed out"; exit 1 }
           Get-Content selftest_out\selftest.log
           if ((Get-Content selftest_out\selftest.log -TotalCount 1) -ne "OK") { exit 1 }
