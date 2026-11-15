@@ -1,0 +1,36 @@
+name: mirror-models
+# 文字起こしAI（faster-whisper）のモデルを Hugging Face から取得し、
+# このリポジトリの Releases（タグ models）に置く。アプリはここからダウンロードする。
+on:
+  workflow_dispatch:
+  push:
+    paths: [".github/workflows/mirror-models.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download models
+        run: |
+          pip install -q huggingface_hub
+          python - <<'PY'
+          import shutil, os
+          from huggingface_hub import snapshot_download
+          for name, repo in [("small", "Systran/faster-whisper-small"), ("turbo", "mobiuslabsgmbh/faster-whisper-large-v3-turbo")]:
+              d = snapshot_download(repo, allow_patterns=["*.json", "*.bin", "*.txt"])
+              shutil.make_archive(f"whisper-{name}", "zip", d)
+              print(name, os.path.getsize(f"whisper-{name}.zip") // 1_000_000, "MB")
+          PY
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: models
+          name: 文字起こしAIのモデル
+          prerelease: true
+          files: whisper-*.zip
+          body: アプリが初回の文字起こし時に自動でダウンロードします。

@@ -1,0 +1,8 @@
+build/
+dist/
+installer_out/
+selftest_out/
+ffmpeg/
+__pycache__/
+*.pyc
+*.mp4
