@@ -20,7 +20,7 @@ from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QDoubleSpinBox, QFileDialog, QFrame, QGraphicsScene, QGraphicsSimpleTextItem,
                                QGraphicsView, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                               QMainWindow, QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea,
+                               QMainWindow, QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea, QScrollBar,
                                QSlider, QSpinBox, QSplitter, QStyle, QTableWidget, QTableWidgetItem, QTabWidget,
                                QVBoxLayout, QWidget)
 
@@ -31,9 +31,10 @@ sys.path.insert(0, str(HERE))
 import engine as E  # noqa: E402
 import transcribe as T  # noqa: E402
 import updater  # noqa: E402
+from timeline import Timeline  # noqa: E402
 
 APP_TITLE = "切り抜き動画ツール"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 FONT_DIR = str(HERE / "assets" / "fonts")
 SFX_DIR = str(HERE / "assets" / "sfx")
 VIDEO_EXT = "*.mp4 *.mov *.m4v *.mkv *.avi *.wmv *.webm *.ts *.flv"
@@ -181,9 +182,32 @@ class Main(QMainWindow):
         self.seek = QSlider(Qt.Horizontal); self.seek.sliderMoved.connect(lambda v: self.player.setPosition(v))
         pc.addWidget(self.seek, 1)
         self.time_lbl = QLabel("0:00.0"); pc.addWidget(self.time_lbl)
+        pc.addWidget(QLabel("速度"))
+        self.speed = QComboBox(); self.speed.addItems(["1倍", "1.5倍", "2倍"])
+        self.speed.currentIndexChanged.connect(lambda i: self.player.setPlaybackRate([1.0, 1.5, 2.0][i]))
+        pc.addWidget(self.speed)
         x = QPushButton("選んだカットを再生"); x.clicked.connect(self.play_clip); pc.addWidget(x)
         x = QPushButton("全体を通して再生"); x.clicked.connect(self.play_all); pc.addWidget(x)
         rv.addLayout(pc)
+        # タイムライン（拡大・縮小できる）
+        self.tl = Timeline()
+        self.tl.seekRequested.connect(lambda t: self.player.setPosition(int(t * 1000)))
+        self.tl.clipSelected.connect(lambda i: self.clip_tbl.selectRow(i))
+        self.tl.clipEdited.connect(lambda i: (self.fill_clip_table(), self.fill_cap_table(), self.update_total(),
+                                              self.clip_tbl.selectRow(i)))
+        self.tl.viewChanged.connect(self.sync_tl_scroll)
+        rv.addWidget(self.tl)
+        self.tl_scroll = QScrollBar(Qt.Horizontal)
+        self.tl_scroll.valueChanged.connect(lambda v: self.tl.set_offset(v / 10))
+        rv.addWidget(self.tl_scroll)
+        zr = QHBoxLayout()
+        zr.addWidget(QLabel("タイムラインの拡大"))
+        self.zoom = QSlider(Qt.Horizontal); self.zoom.setRange(0, 100); self.zoom.setValue(0)
+        self.zoom.valueChanged.connect(self.on_zoom); zr.addWidget(self.zoom, 1)
+        self.zoom_lbl = QLabel("全体"); self.zoom_lbl.setMinimumWidth(110); zr.addWidget(self.zoom_lbl)
+        x = QPushButton("全体を表示"); x.clicked.connect(lambda: self.zoom.setValue(0)); zr.addWidget(x)
+        zr.addWidget(QLabel("（Ctrl＋ホイールでも拡大・縮小／カットの端をドラッグで長さ調整）"))
+        rv.addLayout(zr)
 
         self.tabs = QTabWidget()
         # カット
@@ -313,6 +337,7 @@ class Main(QMainWindow):
             return
         self.project = E.Project(source=path)
         self.an = None
+        self.src_duration = info["duration"]
         self.src_lbl.setText(f"{Path(path).name}\n長さ {E.fmt_time(info['duration'])}・{info['width']}×{info['height']}")
         if info["height"] > info["width"]:
             self.asp_v.setChecked(True)
@@ -398,6 +423,13 @@ class Main(QMainWindow):
     # ── 表の更新 ──
     def refresh_all(self):
         self.fill_clip_table(); self.fill_cap_table(); self.fill_sfx_table(); self.update_total()
+        self.refresh_timeline()
+
+    def refresh_timeline(self):
+        dur = self.an["duration"] if self.an else (self.player.duration() / 1000 or getattr(self, "src_duration", 0))
+        loud = self.an["loud"] if self.an and self.an_source == self.project.source else None
+        self.tl.set_data(dur, self.project.clips, loud, self.an["step"] if self.an else 0.5)
+        self.sync_tl_scroll()
 
     def update_total(self):
         t = self.project.total()
@@ -455,7 +487,7 @@ class Main(QMainWindow):
         dur = self.an["duration"] if self.an else None
         if dur:
             c.end = min(c.end, dur)
-        self.fill_clip_table(); self.fill_cap_table(); self.update_total()
+        self.fill_clip_table(); self.fill_cap_table(); self.update_total(); self.tl.update()
 
     def selected_clip(self) -> int:
         r = self.clip_tbl.currentRow()
@@ -463,6 +495,7 @@ class Main(QMainWindow):
 
     def on_clip_select(self):
         r = self.selected_clip()
+        self.tl.set_selected(r)
         if r >= 0 and not self.seq_play:
             self.player.pause()
             self.player.setPosition(int(self.project.clips[r].start * 1000))
@@ -663,6 +696,27 @@ class Main(QMainWindow):
         br = self.cap_item.boundingRect()
         self.cap_item.setPos((vw - br.width()) / 2, vh * 0.86 - br.height())
 
+    def on_zoom(self, v: int):
+        z = 2000 ** (v / 100)
+        if abs(self.tl.zoom - z) > 1e-3:
+            self.tl.set_zoom(z)
+        span = self.tl.visible_span()
+        self.zoom_lbl.setText("全体" if v == 0 else f"×{z:.0f}（約{E.fmt_time(span)[:-2]}幅）")
+
+    def sync_tl_scroll(self):
+        span = self.tl.visible_span()
+        self.tl_scroll.blockSignals(True)
+        self.tl_scroll.setRange(0, int(max(0.0, self.tl.duration - span) * 10))
+        self.tl_scroll.setPageStep(max(1, int(span * 10)))
+        self.tl_scroll.setValue(int(self.tl.offset * 10))
+        self.tl_scroll.blockSignals(False)
+        # Ctrl＋ホイールで変わった拡大率をスライダーにも反映
+        import math
+        v = int(round(100 * math.log(max(1.0, self.tl.zoom)) / math.log(2000)))
+        if v != self.zoom.value():
+            self.zoom.blockSignals(True); self.zoom.setValue(v); self.zoom.blockSignals(False)
+            self.on_zoom(v)
+
     def toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause(); self.seq_play = False
@@ -692,6 +746,7 @@ class Main(QMainWindow):
             self.seek.setValue(ms)
         now = ms / 1000
         self.time_lbl.setText(E.fmt_time(now))
+        self.tl.set_position(now, follow=self.player.playbackState() == QMediaPlayer.PlayingState)
         # カットの終わりで次のカットへ（全体を通して再生）
         if self.seq_play and 0 <= self.seq_index < len(self.project.clips):
             c = self.project.clips[self.seq_index]
