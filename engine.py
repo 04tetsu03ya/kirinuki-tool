@@ -38,6 +38,22 @@ def ffmpeg_bin(name: str = "ffmpeg") -> str:
     return found
 
 
+_ff_major = None
+
+
+def ffmpeg_major() -> int:
+    """ffmpeg の大きいバージョン番号（7 以上はオプションの書き方が少し違う）"""
+    global _ff_major
+    if _ff_major is None:
+        try:
+            out = run([ffmpeg_bin(), "-version"]).stdout.decode("utf-8", "ignore")
+            m = re.search(r"ffmpeg version n?(\d+)\.", out)
+            _ff_major = int(m.group(1)) if m else 99  # 開発版（N-xxxxx）は新しい書き方
+        except Exception:
+            _ff_major = 99
+    return _ff_major
+
+
 def run(cmd: list, **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, creationflags=CREATE_NO_WINDOW, **kw)
 
@@ -441,7 +457,7 @@ def render(project: Project, out_path: str | Path, progress=None, preview: bool 
     """プロジェクトを書き出す（preview=True なら小さく速く）"""
     if not project.clips:
         raise RuntimeError("カットがありません")
-    src = project.source
+    src = str(Path(project.source).resolve())
     info = probe(src)
     W, H = output_size(project, preview)
     fps = 30
@@ -508,7 +524,8 @@ def render(project: Project, out_path: str | Path, progress=None, preview: bool 
         fl.append(f"[{aout}]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[an]")
         aout = "an"
     (tmp / "graph.txt").write_text(";\n".join(fl), encoding="utf-8")
-    cmd += ["-filter_complex_script", "graph.txt", "-map", f"[{vout}]", "-map", f"[{aout}]",
+    graph_opt = ["-/filter_complex", "graph.txt"] if ffmpeg_major() >= 7 else ["-filter_complex_script", "graph.txt"]
+    cmd += graph_opt + ["-map", f"[{vout}]", "-map", f"[{aout}]",
             "-c:v", "libx264", "-preset", "ultrafast" if preview else "veryfast", "-crf", "28" if preview else "20",
             "-r", str(fps), "-c:a", "aac", "-b:a", "128k" if preview else "192k", "-movflags", "+faststart",
             str(Path(out_path).resolve())]
