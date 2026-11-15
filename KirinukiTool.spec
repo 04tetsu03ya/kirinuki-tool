@@ -10,7 +10,7 @@ datas, binaries, hiddenimports = [], [], []
 for pkg in ("faster_whisper", "ctranslate2", "onnxruntime", "tokenizers"):
     d, b, h = collect_all(pkg)
     datas += d; binaries += b; hiddenimports += h
-hiddenimports += ["truststore", "certifi", "engine", "transcribe", "updater"]
+hiddenimports += ["truststore", "certifi", "engine", "transcribe", "updater", "fonts", "timeline", "fontTools.ttLib"]
 datas += [("assets", "assets")]
 if Path("ffmpeg").exists():
     binaries += [(str(p), "ffmpeg") for p in Path("ffmpeg").glob("*") if p.suffix.lower() in (".exe", ".dll")]

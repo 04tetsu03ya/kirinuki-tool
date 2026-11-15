@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: python -m pip install pyinstaller PySide6 faster-whisper numpy truststore certifi
+        run: python -m pip install pyinstaller PySide6 faster-whisper numpy truststore certifi fonttools
       - name: Get ffmpeg (shared build)
         shell: pwsh
         run: |

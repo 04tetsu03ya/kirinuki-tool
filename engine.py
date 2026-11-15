@@ -106,6 +106,10 @@ class Caption:
     start: float  # カットの頭からの秒
     end: float
     text: str
+    font: str = ""      # 空なら全体の設定
+    color: str = ""     # "#RRGGBB"。空なら全体の設定
+    outline: str = ""   # ふちの色
+    scale: int = 0      # 大きさ（%）。0なら全体の設定
 
 
 @dataclass
@@ -138,8 +142,10 @@ class Project:
     source_volume: float = 1.0
     normalize: bool = True        # 音量を自動でそろえる
     fade: bool = False            # カットのつなぎをフェードにする
-    caption_size: int = 0         # 0=自動
-    caption_style: str = "white"  # white / yellow / black
+    caption_font: str = "Noto Sans JP Black"
+    caption_color: str = "#FFFFFF"
+    caption_outline: str = "#000000"
+    caption_scale: int = 100      # 自動の大きさに対する%
 
     def total(self) -> float:
         return sum(c.length for c in self.clips)
@@ -150,9 +156,16 @@ class Project:
     @staticmethod
     def from_json(s: str) -> "Project":
         d = json.loads(s)
-        p = Project(**{k: v for k, v in d.items() if k not in ("clips", "sfx")})
+        # 古い形式（v0.2 まで）の見た目の設定を引き継ぐ
+        old = {"white": ("#FFFFFF", "#000000"), "yellow": ("#FFF000", "#000000"),
+               "black": ("#000000", "#FFFFFF"), "pink": ("#FF69B4", "#FFFFFF")}
+        if "caption_style" in d and "caption_color" not in d:
+            d["caption_color"], d["caption_outline"] = old.get(d["caption_style"], old["white"])
+        known = set(Project.__dataclass_fields__) - {"clips", "sfx"}
+        p = Project(**{k: v for k, v in d.items() if k in known})
         for c in d.get("clips", []):
-            caps = [Caption(**x) for x in c.pop("captions", [])]
+            caps = [Caption(**{k: v for k, v in x.items() if k in Caption.__dataclass_fields__})
+                    for x in c.pop("captions", [])]
             p.clips.append(Clip(**c, captions=caps))
         p.sfx = [Sfx(**x) for x in d.get("sfx", [])]
         return p
@@ -373,47 +386,63 @@ NO_HEAD = set("、。，．！？!?）」』】〉》ー～…・ぁぃぅぇぉ
 
 
 def wrap_text(text: str, per_line: int, max_lines: int = 2) -> str:
-    """テロップの改行（句読点や小さい「っ」などが行頭に来ないようにする）"""
+    """テロップの改行：行の長さをそろえ、句読点のあとで折り返し、行頭に「、」や「っ」が来ないようにする"""
     text = " ".join(text.strip().split())
-    lines, cur = [], ""
-    i = 0
+    if len(text) <= per_line:
+        return text
+    limit = per_line
+    n = math.ceil(len(text) / per_line)
+    per = math.ceil(len(text) / n)
+    lines, i = [], 0
     while i < len(text):
-        cur += text[i]
-        i += 1
-        if len(cur) >= per_line and i < len(text):
-            # 次の文字が行頭禁止なら、この行に含める
-            while i < len(text) and text[i] in NO_HEAD:
-                cur += text[i]
-                i += 1
-            # 句読点・空白の直後で折り返せるなら、そこで
-            cut = max(cur.rfind(c) for c in "、。！？!? ")
-            if per_line * 0.5 <= cut < len(cur) - 1:
-                i -= len(cur) - cut - 1
-                cur = cur[: cut + 1]
-            lines.append(cur.strip())
-            cur = ""
-    if cur.strip():
-        lines.append(cur.strip())
+        j = min(len(text), i + per)
+        while j < len(text) and text[j] in NO_HEAD:  # 行頭禁止の文字は前の行へ
+            j += 1
+        if j < len(text):
+            seg = text[i:j]
+            cut = max(seg.rfind(c) for c in "、。！？!? ：・")
+            if per * 0.5 <= cut < len(seg) - 1:
+                j = i + cut + 1
+        lines.append(text[i:j].strip())
+        i = j
+    lines = [x for x in lines if x]
+    # 最後の行が短すぎるときは前の行にくっつける
+    if len(lines) >= 2 and len(lines[-1]) <= 2 and len(lines[-2]) + len(lines[-1]) <= limit + 1:
+        last = lines.pop()
+        lines[-1] += last
     if len(lines) > max_lines:
         lines = lines[:max_lines]
         lines[-1] = lines[-1][:-1] + "…"
     return "\\N".join(lines)
 
 
-STYLES = {  # (文字色, 縁取り色) ASS は &HAABBGGRR
-    "white": ("&H00FFFFFF", "&H00000000"),
-    "yellow": ("&H0000F0FF", "&H00000000"),
-    "black": ("&H00000000", "&H00FFFFFF"),
-    "pink": ("&H00B469FF", "&H00FFFFFF"),
-}
+def ass_color(hexrgb: str, default: str = "#FFFFFF") -> str:
+    """#RRGGBB → ASS の &HBBGGRR&"""
+    h = (hexrgb or default).lstrip("#")
+    if len(h) != 6:
+        h = default.lstrip("#")
+    return f"&H{h[4:6]}{h[2:4]}{h[0:2]}&".upper()
 
 
-def build_ass(project: Project, W: int, H: int, font: str) -> str:
+def chars_per_line(W: int, H: int, scale: int) -> int:
+    """1行の文字数（文字が大きいほど少なく）。画面の幅に収まるように"""
+    base = 13 if H > W else 22
+    return max(4, int(base * 100 / max(20, scale or 100)))
+
+
+def base_caption_size(W: int, H: int) -> int:
+    return int(W * 0.075) if H > W else int(H * 0.068)
+
+
+def build_ass(project: Project, W: int, H: int, font: str | None = None) -> str:
     vertical = H > W
-    size = project.caption_size or (int(W * 0.075) if vertical else int(H * 0.068))
-    per_line = 13 if vertical else 22
+    base = base_caption_size(W, H)
+    size = int(base * max(20, project.caption_scale) / 100)
+    per_line = chars_per_line(W, H, project.caption_scale)
     max_lines = 3 if vertical else 2
-    prim, outl = STYLES.get(project.caption_style, STYLES["white"])
+    family = font or project.caption_font or "Noto Sans JP Black"
+    prim = ass_color(project.caption_color, "#FFFFFF").replace("&H", "&H00").rstrip("&")
+    outl = ass_color(project.caption_outline, "#000000").replace("&H", "&H00").rstrip("&")
     margin_v = int(H * (0.22 if vertical else 0.07))
     head = f"""[Script Info]
 ScriptType: v4.00+
@@ -424,7 +453,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font},{size},{prim},&H000000FF,{outl},&H80000000,0,0,0,0,100,100,0,0,1,{max(2, size // 11)},{max(1, size // 30)},2,{int(W*0.05)},{int(W*0.05)},{margin_v},1
+Style: Default,{family},{size},{prim},&H000000FF,{outl},&H80000000,0,0,0,0,100,100,0,0,1,{max(2, size // 11)},{max(1, size // 30)},2,{int(W*0.05)},{int(W*0.05)},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -436,8 +465,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             s = t0 + max(0.0, cap.start)
             e = t0 + min(c.length, cap.end)
             if e - s > 0.05 and cap.text.strip():
-                txt = wrap_text(cap.text, per_line, max_lines).replace("{", "（").replace("}", "）")
-                lines.append(f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Default,,0,0,0,,{txt}")
+                # このテロップだけの見た目（フォント・色・大きさ）
+                tags = ""
+                if cap.font:
+                    tags += f"\\fn{cap.font}"
+                if cap.scale:
+                    fs = int(base * max(20, cap.scale) / 100)
+                    tags += f"\\fs{fs}\\bord{max(2, fs // 11)}\\shad{max(1, fs // 30)}"
+                if cap.color:
+                    tags += f"\\c{ass_color(cap.color)}"
+                if cap.outline:
+                    tags += f"\\3c{ass_color(cap.outline)}"
+                pl = chars_per_line(W, H, cap.scale or project.caption_scale)
+                txt = wrap_text(cap.text, pl, max_lines).replace("{", "（").replace("}", "）")
+                lines.append(f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Default,,0,0,0,,{{{tags}}}{txt}" if tags
+                             else f"Dialogue: 0,{_ass_time(s)},{_ass_time(e)},Default,,0,0,0,,{txt}")
         t0 += c.length
     return head + "\n".join(lines) + "\n"
 
@@ -453,7 +495,8 @@ def output_size(project: Project, preview: bool = False) -> tuple[int, int]:
 
 
 def render(project: Project, out_path: str | Path, progress=None, preview: bool = False,
-           font_dir: str | None = None, font_name: str = "Noto Sans JP Black", sfx_dir: str | None = None) -> Path:
+           font_dir: str | None = None, font_name: str | None = None, sfx_dir: str | None = None,
+           font_files: list | None = None) -> Path:
     """プロジェクトを書き出す（preview=True なら小さく速く）"""
     if not project.clips:
         raise RuntimeError("カットがありません")
@@ -504,9 +547,17 @@ def render(project: Project, out_path: str | Path, progress=None, preview: bool 
     has_caps = any(cap.text.strip() for c in project.clips for cap in c.captions)
     if has_caps:
         (tmp / "subs.ass").write_text(build_ass(project, W, H, font_name), encoding="utf-8")
-        fd_opt = f":fontsdir=fonts" if font_dir else ""
-        if font_dir:
-            shutil.copytree(Path(font_dir).resolve(), tmp / "fonts", dirs_exist_ok=True)
+        # 使うフォントを作業フォルダにまとめる（同梱フォント＋パソコンのフォント）
+        (tmp / "fonts").mkdir(exist_ok=True)
+        files = list(font_files or [])
+        if font_dir and not font_files:
+            files += [str(f) for f in Path(font_dir).glob("*") if f.suffix.lower() in (".ttf", ".otf", ".ttc")]
+        for f in files:
+            try:
+                shutil.copy2(f, tmp / "fonts" / Path(f).name)
+            except OSError:
+                pass
+        fd_opt = ":fontsdir=fonts" if files else ""
         fl.append(f"[vc]subtitles=subs.ass{fd_opt}[vs]")
         vout = "vs"
     # 効果音

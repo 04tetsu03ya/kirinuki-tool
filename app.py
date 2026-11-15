@@ -14,10 +14,11 @@ import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRectF, QSizeF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QIcon, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QSoundEffect
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QGraphicsItem, QGraphicsRectItem, QCheckBox, QColorDialog, QComboBox, QDialog,
+                               QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFrame, QGraphicsScene, QGraphicsSimpleTextItem,
                                QGraphicsView, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
                                QMainWindow, QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea, QScrollBar,
@@ -31,10 +32,11 @@ sys.path.insert(0, str(HERE))
 import engine as E  # noqa: E402
 import transcribe as T  # noqa: E402
 import updater  # noqa: E402
+import fonts as F  # noqa: E402
 from timeline import Timeline  # noqa: E402
 
 APP_TITLE = "切り抜き動画ツール"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 FONT_DIR = str(HERE / "assets" / "fonts")
 SFX_DIR = str(HERE / "assets" / "sfx")
 VIDEO_EXT = "*.mp4 *.mov *.m4v *.mkv *.avi *.wmv *.webm *.ts *.flv"
@@ -67,6 +69,101 @@ def run_bg(fn, on_done, on_fail, on_progress):
 
 def tsec(s: str) -> float:
     return E.parse_time(s)
+
+
+class ColorButton(QPushButton):
+    """押すと色を選べるボタン（色見本つき）"""
+    changed = Signal()
+
+    def __init__(self, color: str):
+        super().__init__()
+        self.color = color
+        self.setMinimumWidth(110)
+        self.clicked.connect(self.pick)
+        self.set_color(color)
+
+    def set_color(self, c: str):
+        self.color = c.upper()
+        light = QColor(c).lightness() > 140
+        self.setText(self.color)
+        self.setStyleSheet(f"background:{c}; color:{'#000' if light else '#fff'}; border:1px solid #888; padding:4px;")
+
+    def pick(self):
+        c = QColorDialog.getColor(QColor(self.color), self, "色を選ぶ")
+        if c.isValid():
+            self.set_color(c.name()); self.changed.emit()
+
+
+class FontCombo(QComboBox):
+    """日本語フォントの選択（同梱フォント＋パソコンのフォント）。各項目はそのフォントで表示"""
+    _fonts = None
+
+    def __init__(self, allow_default: bool = False):
+        super().__init__()
+        self.setMaxVisibleItems(20)
+        if FontCombo._fonts is None:
+            FontCombo._fonts = F.all_fonts(T.data_dir())
+            FontCombo._qt = {}
+            for fi in FontCombo._fonts:
+                if fi.bundled:
+                    fid = QFontDatabase.addApplicationFont(fi.path)
+                    fams = QFontDatabase.applicationFontFamilies(fid) if fid >= 0 else []
+                    FontCombo._qt[fi.family] = fams[0] if fams else fi.family
+                else:
+                    FontCombo._qt[fi.family] = fi.family
+        self.fonts = FontCombo._fonts
+        if allow_default:
+            self.addItem("全体と同じ", "")
+        sep_done = False
+        for fi in self.fonts:
+            if not fi.bundled and not sep_done:
+                self.insertSeparator(self.count()); sep_done = True
+            self.addItem(fi.label, fi.family)
+            self.setItemData(self.count() - 1, QFont(self.qt_family(fi.family), 12), Qt.FontRole)
+        self.select_family("" if allow_default else F.DEFAULT_FAMILY)
+
+    def qt_family(self, family: str) -> str:
+        return FontCombo._qt.get(family, family)
+
+    def family(self) -> str:
+        return self.currentData() or ""
+
+    def label_of(self, family: str) -> str:
+        return next((f.label for f in self.fonts if f.family == family), family)
+
+    def select_family(self, family: str):
+        i = self.findData(family)
+        if i >= 0:
+            self.setCurrentIndex(i)
+
+
+class LookDialog(QDialog):
+    """選んだテロップだけの見た目（フォント・色・大きさ）"""
+
+    def __init__(self, parent, cap, project, main_font_box):
+        super().__init__(parent)
+        self.setWindowTitle("選んだテロップの見た目")
+        g = QGridLayout(self)
+        g.addWidget(QLabel("フォント"), 0, 0)
+        self.font = FontCombo(allow_default=True); self.font.select_family(cap.font); g.addWidget(self.font, 0, 1, 1, 2)
+        self.use_col = QCheckBox("文字の色を変える"); self.use_col.setChecked(bool(cap.color)); g.addWidget(self.use_col, 1, 0)
+        self.col = ColorButton(cap.color or project.caption_color); g.addWidget(self.col, 1, 1)
+        self.use_out = QCheckBox("ふちの色を変える"); self.use_out.setChecked(bool(cap.outline)); g.addWidget(self.use_out, 2, 0)
+        self.out = ColorButton(cap.outline or project.caption_outline); g.addWidget(self.out, 2, 1)
+        self.col.changed.connect(lambda: self.use_col.setChecked(True))
+        self.out.changed.connect(lambda: self.use_out.setChecked(True))
+        self.use_size = QCheckBox("大きさを変える"); self.use_size.setChecked(bool(cap.scale)); g.addWidget(self.use_size, 3, 0)
+        self.size = QSlider(Qt.Horizontal); self.size.setRange(40, 300); self.size.setValue(cap.scale or project.caption_scale)
+        self.size_lbl = QLabel(f"{self.size.value()}%")
+        self.size.valueChanged.connect(lambda v: (self.size_lbl.setText(f"{v}%"), self.use_size.setChecked(True)))
+        g.addWidget(self.size, 3, 1); g.addWidget(self.size_lbl, 3, 2)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        g.addWidget(bb, 4, 0, 1, 3)
+
+    def result_values(self):
+        return (self.font.family(), self.col.color if self.use_col.isChecked() else "",
+                self.out.color if self.use_out.isChecked() else "", self.size.value() if self.use_size.isChecked() else 0)
 
 
 class Main(QMainWindow):
@@ -139,6 +236,8 @@ class Main(QMainWindow):
         gl.addWidget(QLabel("元の音の音量"), 5, 0)
         self.src_vol = QSlider(Qt.Horizontal); self.src_vol.setRange(0, 200); self.src_vol.setValue(100)
         gl.addWidget(self.src_vol, 5, 1)
+        self.asp_v.toggled.connect(lambda _: (self.sync_settings(), self.fit_video()))
+        self.fill.currentIndexChanged.connect(lambda _: self.fit_video())
         lv.addWidget(g)
 
         g = QGroupBox("④ テロップ"); gl = QGridLayout(g)
@@ -146,17 +245,35 @@ class Main(QMainWindow):
         gl.addWidget(self.auto_cap, 0, 0, 1, 2)
         gl.addWidget(QLabel("文字起こしの精度"), 1, 0)
         self.cap_model = QComboBox(); self.cap_model.addItems([v[0] for v in T.MODELS.values()]); gl.addWidget(self.cap_model, 1, 1)
-        gl.addWidget(QLabel("文字の色"), 2, 0)
-        self.cap_style = QComboBox(); self.cap_style.addItems(["白（黒ふち）", "黄（黒ふち）", "黒（白ふち）", "ピンク（白ふち）"])
-        gl.addWidget(self.cap_style, 2, 1)
-        gl.addWidget(QLabel("文字の大きさ"), 3, 0)
-        self.cap_size = QComboBox(); self.cap_size.addItems(["自動", "小", "中", "大", "特大"]); gl.addWidget(self.cap_size, 3, 1)
         lv.addWidget(g)
 
         self.make_btn = QPushButton("▶ 自動で作る"); self.make_btn.setMinimumHeight(44)
         f = self.make_btn.font(); f.setPointSize(f.pointSize() + 3); f.setBold(True); self.make_btn.setFont(f)
         self.make_btn.clicked.connect(self.make_auto)
         lv.addWidget(self.make_btn)
+
+        g = QGroupBox("⑤ テロップの見た目（全体・あとからいつでも変更OK）"); gl = QGridLayout(g)
+        gl.addWidget(QLabel("フォント"), 0, 0)
+        self.font_box = FontCombo(); self.font_box.currentIndexChanged.connect(self.on_look_changed)
+        gl.addWidget(self.font_box, 0, 1, 1, 2)
+        gl.addWidget(QLabel("文字の色"), 1, 0)
+        self.col_btn = ColorButton("#FFFFFF"); self.col_btn.changed.connect(self.on_look_changed); gl.addWidget(self.col_btn, 1, 1)
+        gl.addWidget(QLabel("ふちの色"), 2, 0)
+        self.out_btn = ColorButton("#000000"); self.out_btn.changed.connect(self.on_look_changed); gl.addWidget(self.out_btn, 2, 1)
+        pr = QHBoxLayout()
+        for name, fg, bd in (("白", "#FFFFFF", "#000000"), ("黄", "#FFF000", "#000000"), ("黒", "#000000", "#FFFFFF"),
+                             ("ピンク", "#FF69B4", "#FFFFFF"), ("水色", "#40D0FF", "#000000")):
+            b = QPushButton(name); b.setMaximumWidth(56)
+            b.clicked.connect(lambda _, a=fg, c=bd: (self.col_btn.set_color(a), self.out_btn.set_color(c), self.on_look_changed()))
+            pr.addWidget(b)
+        gl.addWidget(QLabel("早く選ぶ"), 3, 0); gl.addLayout(pr, 3, 1, 1, 2)
+        gl.addWidget(QLabel("大きさ"), 4, 0)
+        self.size_sl = QSlider(Qt.Horizontal); self.size_sl.setRange(40, 250); self.size_sl.setValue(100)
+        self.size_lbl = QLabel("100%")
+        self.size_sl.valueChanged.connect(lambda v: (self.size_lbl.setText(f"{v}%"), self.on_look_changed()))
+        gl.addWidget(self.size_sl, 4, 1); gl.addWidget(self.size_lbl, 4, 2)
+        lv.addWidget(g)
+
         lv.addStretch(1)
         sc = QScrollArea(); sc.setWidget(left); sc.setWidgetResizable(True); sc.setMinimumWidth(360)
         split.addWidget(sc)
@@ -167,12 +284,16 @@ class Main(QMainWindow):
         self.view = QGraphicsView(self.scene); self.view.setBackgroundBrush(QColor("#111"))
         self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.view.setFrameShape(QFrame.NoFrame); self.view.setMinimumHeight(300)
-        self.vitem = QGraphicsVideoItem(); self.scene.addItem(self.vitem)
+        # 出来上がりの画面（横 16:9／縦 9:16）の枠。映像はこの枠の中に、書き出しと同じ形で映す
+        self.frame = QGraphicsRectItem(); self.frame.setBrush(QColor("#2a2a2e")); self.frame.setPen(QPen(QColor("#555"), 1))
+        self.frame.setFlag(QGraphicsItem.ItemClipsChildrenToShape, True)
+        self.scene.addItem(self.frame)
+        self.vitem = QGraphicsVideoItem(self.frame)
         self.cap_item = QGraphicsSimpleTextItem(""); self.scene.addItem(self.cap_item)
         self.cap_item.setBrush(QColor("white")); self.cap_item.setPen(QColor("black"))
         self.player = QMediaPlayer(self); self.player.setVideoOutput(self.vitem)
         if not os.environ.get("KIRINUKI_NO_AUDIO"):  # テスト環境（音が出ない機械）用のスイッチ
-            self.audio = QAudioOutput(self); self.player.setAudioOutput(self.audio)
+            self.audio = QAudioOutput(self); self.player.setAudioOutput(self.audio); self.audio.setVolume(0.8)
         self.player.positionChanged.connect(self.on_pos)
         self.player.durationChanged.connect(lambda d: self.seek.setRange(0, d))
         rv.addWidget(self.view, 3)
@@ -186,6 +307,10 @@ class Main(QMainWindow):
         self.speed = QComboBox(); self.speed.addItems(["1倍", "1.5倍", "2倍"])
         self.speed.currentIndexChanged.connect(lambda i: self.player.setPlaybackRate([1.0, 1.5, 2.0][i]))
         pc.addWidget(self.speed)
+        pc.addWidget(QLabel("音量"))
+        self.pv_vol = QSlider(Qt.Horizontal); self.pv_vol.setRange(0, 100); self.pv_vol.setValue(80); self.pv_vol.setMaximumWidth(110)
+        self.pv_vol.valueChanged.connect(self.on_preview_volume)
+        pc.addWidget(self.pv_vol)
         x = QPushButton("選んだカットを再生"); x.clicked.connect(self.play_clip); pc.addWidget(x)
         x = QPushButton("全体を通して再生"); x.clicked.connect(self.play_all); pc.addWidget(x)
         rv.addLayout(pc)
@@ -232,15 +357,19 @@ class Main(QMainWindow):
         self.tabs.addTab(w, "カット")
         # テロップ
         w = QWidget(); v = QVBoxLayout(w)
-        self.cap_tbl = QTableWidget(0, 4)
-        self.cap_tbl.setHorizontalHeaderLabels(["カット", "開始（秒）", "終了（秒）", "文字（クリックで直せます）"])
+        self.cap_tbl = QTableWidget(0, 5)
+        self.cap_tbl.setHorizontalHeaderLabels(["カット", "開始（秒）", "終了（秒）", "文字（クリックで直せます）", "見た目"])
         self.cap_tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.cap_tbl.setColumnWidth(4, 230)
         self.cap_tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.cap_tbl.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.cap_tbl.itemChanged.connect(self.on_cap_edit)
         self.cap_tbl.cellDoubleClicked.connect(self.jump_to_caption)
         v.addWidget(self.cap_tbl)
         hb = QHBoxLayout()
         for text, fn in (("今の位置にテロップを追加", self.add_caption), ("削除", self.del_caption),
+                         ("選んだテロップの見た目を変える…", self.edit_caption_look),
+                         ("全体の見た目に戻す", self.reset_caption_look),
                          ("文字起こしをやり直す", self.redo_transcribe)):
             x = QPushButton(text); x.clicked.connect(fn); hb.addWidget(x)
         v.addLayout(hb)
@@ -307,10 +436,25 @@ class Main(QMainWindow):
         p.fade = self.trans.currentIndex() == 1
         p.normalize = self.norm.isChecked()
         p.source_volume = self.src_vol.value() / 100
-        p.caption_style = ["white", "yellow", "black", "pink"][self.cap_style.currentIndex()]
-        W, H = E.output_size(p)
-        base = int(W * 0.075) if H > W else int(H * 0.068)
-        p.caption_size = [0, int(base * 0.75), int(base * 0.9), int(base * 1.15), int(base * 1.4)][self.cap_size.currentIndex()]
+        p.caption_font = self.font_box.family() or F.DEFAULT_FAMILY
+        p.caption_color = self.col_btn.color
+        p.caption_outline = self.out_btn.color
+        p.caption_scale = self.size_sl.value()
+
+    def on_look_changed(self, *_):
+        """全体の見た目を変えたら、すぐプレビューに反映"""
+        self.sync_settings()
+        self._cap_key = "x"; self.on_pos(self.player.position())
+        self.fill_cap_table()
+
+    def load_look(self, p: E.Project):
+        for w in (self.font_box, self.col_btn, self.out_btn, self.size_sl):
+            w.blockSignals(True)
+        self.font_box.select_family(p.caption_font)
+        self.col_btn.set_color(p.caption_color); self.out_btn.set_color(p.caption_outline)
+        self.size_sl.setValue(p.caption_scale); self.size_lbl.setText(f"{p.caption_scale}%")
+        for w in (self.font_box, self.col_btn, self.out_btn, self.size_sl):
+            w.blockSignals(False)
 
     # ── 素材 ──
     def dragEnterEvent(self, e):
@@ -336,6 +480,7 @@ class Main(QMainWindow):
             QMessageBox.warning(self, APP_TITLE, str(e))
             return
         self.project = E.Project(source=path)
+        self.sync_settings() if hasattr(self, "font_box") else None
         self.an = None
         self.src_duration = info["duration"]
         self.src_lbl.setText(f"{Path(path).name}\n長さ {E.fmt_time(info['duration'])}・{info['width']}×{info['height']}")
@@ -552,7 +697,44 @@ class Main(QMainWindow):
             tb.setItem(i, 1, QTableWidgetItem(f"{cap.start:.1f}"))
             tb.setItem(i, 2, QTableWidgetItem(f"{cap.end:.1f}"))
             tb.setItem(i, 3, QTableWidgetItem(cap.text))
+            it = QTableWidgetItem(self.look_text(cap)); it.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            if cap.color:
+                it.setForeground(QColor(cap.color)); it.setBackground(QColor(cap.outline or "#000000"))
+            tb.setItem(i, 4, it)
         self._loading_tables = False
+
+    def look_text(self, cap) -> str:
+        if not (cap.font or cap.color or cap.outline or cap.scale):
+            return "全体と同じ"
+        parts = []
+        if cap.font:
+            parts.append(self.font_box.label_of(cap.font))
+        if cap.color:
+            parts.append(f"色 {cap.color}")
+        if cap.scale:
+            parts.append(f"{cap.scale}%")
+        return "・".join(parts)
+
+    def selected_caps(self) -> list:
+        rows = sorted({i.row() for i in self.cap_tbl.selectedItems()})
+        return [self._cap_rows[r][2] for r in rows if r < len(self._cap_rows)]
+
+    def edit_caption_look(self):
+        caps = self.selected_caps()
+        if not caps:
+            QMessageBox.information(self, APP_TITLE, "見た目を変えたいテロップを一覧で選んでください（Ctrl/Shiftで複数選べます）"); return
+        self.sync_settings()
+        d = LookDialog(self, caps[0], self.project, self.font_box)
+        if d.exec() == QDialog.Accepted:
+            font, color, outline, scale = d.result_values()
+            for c in caps:
+                c.font, c.color, c.outline, c.scale = font, color, outline, scale
+            self.fill_cap_table(); self._cap_key = "x"; self.on_pos(self.player.position())
+
+    def reset_caption_look(self):
+        for c in self.selected_caps():
+            c.font, c.color, c.outline, c.scale = "", "", "", 0
+        self.fill_cap_table(); self._cap_key = "x"; self.on_pos(self.player.position())
 
     def on_cap_edit(self, item):
         if self._loading_tables or item.row() >= len(self._cap_rows):
@@ -673,9 +855,9 @@ class Main(QMainWindow):
             se = self.sounds.get(p)
             if se is None:
                 se = QSoundEffect(self); se.setSource(QUrl.fromLocalFile(p)); self.sounds[p] = se
-            se.setVolume(min(1.0, s.volume)); se.play()
+            se.setVolume(min(1.0, s.volume) * self.pv_vol.value() / 100); se.play()
         else:
-            mp = QMediaPlayer(self); ao = QAudioOutput(self); mp.setAudioOutput(ao); ao.setVolume(min(1.0, s.volume))
+            mp = QMediaPlayer(self); ao = QAudioOutput(self); mp.setAudioOutput(ao); ao.setVolume(min(1.0, s.volume) * self.pv_vol.value() / 100)
             mp.setSource(QUrl.fromLocalFile(p)); mp.play(); self.sounds[("tmp", p)] = (mp, ao)
 
     # ── プレビュー ──
@@ -683,18 +865,32 @@ class Main(QMainWindow):
         super().resizeEvent(e)
         QTimer.singleShot(0, self.fit_video)
 
+    def frame_rect(self) -> QRectF:
+        """プレビューの中の「出来上がりの画面」の位置と大きさ"""
+        vw, vh = self.view.viewport().width(), self.view.viewport().height()
+        vertical = self.asp_v.isChecked() if hasattr(self, "asp_v") else False
+        ar = 9 / 16 if vertical else 16 / 9
+        w = min(vw, vh * ar); h = w / ar
+        return QRectF((vw - w) / 2, (vh - h) / 2, w, h)
+
     def fit_video(self):
         vw, vh = self.view.viewport().width(), self.view.viewport().height()
-        self.vitem.setSize(QSizeF(vw, vh)); self.vitem.setPos(0, 0)
         self.scene.setSceneRect(QRectF(0, 0, vw, vh))
-        self.cap_font = QFont(); self.cap_font.setPixelSize(max(14, int(vh * 0.055))); self.cap_font.setBold(True)
-        self.cap_item.setFont(self.cap_font)
-        self.place_caption()
+        fr = self.frame_rect()
+        self.frame.setRect(QRectF(0, 0, fr.width(), fr.height())); self.frame.setPos(fr.topLeft())
+        crop = hasattr(self, "fill") and self.fill.currentIndex() == 1
+        self.vitem.setAspectRatioMode(Qt.KeepAspectRatioByExpanding if crop else Qt.KeepAspectRatio)
+        self.vitem.setSize(QSizeF(fr.width(), fr.height())); self.vitem.setPos(0, 0)
+        self._cap_key = "x"
+        if hasattr(self, "tl"):
+            self.on_pos(self.player.position())
 
     def place_caption(self):
-        vw, vh = self.view.viewport().width(), self.view.viewport().height()
+        fr = self.frame_rect()
+        vertical = fr.height() > fr.width()
         br = self.cap_item.boundingRect()
-        self.cap_item.setPos((vw - br.width()) / 2, vh * 0.86 - br.height())
+        margin = fr.height() * (0.22 if vertical else 0.07)  # 書き出しと同じ下からの余白
+        self.cap_item.setPos(fr.x() + (fr.width() - br.width()) / 2, fr.bottom() - margin - br.height())
 
     def on_zoom(self, v: int):
         z = 2000 ** (v / 100)
@@ -716,6 +912,11 @@ class Main(QMainWindow):
         if v != self.zoom.value():
             self.zoom.blockSignals(True); self.zoom.setValue(v); self.zoom.blockSignals(False)
             self.on_zoom(v)
+
+    def on_preview_volume(self, v: int):
+        """プレビューの音量（書き出す動画の音量は変わらない）"""
+        if hasattr(self, "audio"):
+            self.audio.setVolume(v / 100)
 
     def toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlayingState:
@@ -762,16 +963,36 @@ class Main(QMainWindow):
             for k, s in enumerate(self.project.sfx):
                 if k not in self.fired and 0 <= out_t - s.time < 0.3:
                     self.fired.add(k); self.play_sfx(s)
-        # テロップの重ね表示
-        txt = ""
+        # テロップの重ね表示（実際のフォント・色・大きさで）
+        found = None
         for c in self.project.clips:
             if c.start <= now <= c.end:
                 for cap in c.captions:
                     if cap.start <= now - c.start <= cap.end:
-                        txt = cap.text; break
+                        found = cap; break
                 break
-        if txt != self.cap_item.text():
-            self.cap_item.setText(txt); self.place_caption()
+        key = None if found is None else (found.text, found.font, found.color, found.outline, found.scale,
+                                          self.project.caption_font, self.project.caption_color,
+                                          self.project.caption_outline, self.project.caption_scale, self.project.aspect)
+        if key != getattr(self, "_cap_key", "x"):
+            self._cap_key = key
+            self.show_caption(found)
+
+    def show_caption(self, cap):
+        if cap is None or not cap.text.strip():
+            self.cap_item.setText(""); return
+        p = self.project
+        W, H = E.output_size(p)
+        k = self.frame_rect().height() / H  # 出来上がりの画面 → プレビューの大きさ
+        base = E.base_caption_size(W, H)
+        size = base * ((cap.scale or p.caption_scale) / 100) * k
+        f = QFont(self.font_box.qt_family(cap.font or p.caption_font)); f.setPixelSize(max(10, int(size)))
+        per = E.chars_per_line(W, H, cap.scale or p.caption_scale)
+        self.cap_item.setFont(f)
+        self.cap_item.setText(E.wrap_text(cap.text, per, 3 if H > W else 2).replace("\\N", "\n"))
+        self.cap_item.setBrush(QColor(cap.color or p.caption_color))
+        self.cap_item.setPen(QPen(QColor(cap.outline or p.caption_outline), max(1.5, size / 14)))
+        self.place_caption()
 
     # ── 書き出し・保存 ──
     def export(self):
@@ -793,8 +1014,10 @@ class Main(QMainWindow):
                 os.startfile(str(Path(out).parent))  # type: ignore[attr-defined]
         self.set_busy(True)
         self.msg("書き出し中…")
+        fams = {proj.caption_font} | {cap.font for c in proj.clips for cap in c.captions if cap.font}
+        files = F.files_for(fams, self.font_box.fonts)
         self.jobs.append(run_bg(lambda p: E.render(proj, f, lambda r: p(r, f"書き出し中… {r*100:.0f}%"),
-                                                   font_dir=FONT_DIR, sfx_dir=SFX_DIR),
+                                                   sfx_dir=SFX_DIR, font_files=files),
                                 done, self.fail, self.on_progress))
 
     def save_project(self):
@@ -821,6 +1044,7 @@ class Main(QMainWindow):
         self.load_video(p.source)
         self.project = p
         (self.asp_v if p.aspect == "9:16" else self.asp_h).setChecked(True)
+        self.load_look(p)
         self.refresh_all()
         self.msg("プロジェクトを開きました")
 
