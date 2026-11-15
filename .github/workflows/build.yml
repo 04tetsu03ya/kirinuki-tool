@@ -1,0 +1,80 @@
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: [".github/workflows/mirror-models.yml", "README.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install pyinstaller PySide6 faster-whisper numpy truststore certifi
+      - name: Get ffmpeg (shared build)
+        shell: pwsh
+        run: |
+          $u = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          Invoke-WebRequest $u -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          New-Item -ItemType Directory ffmpeg | Out-Null
+          Get-ChildItem ffmpeg_tmp -Recurse -Include ffmpeg.exe,ffprobe.exe,*.dll | Copy-Item -Destination ffmpeg
+          Get-ChildItem ffmpeg_tmp -Recurse -Include LICENSE.txt | Select-Object -First 1 | Copy-Item -Destination ffmpeg\FFMPEG-LICENSE.txt
+          Get-ChildItem ffmpeg | Select-Object Name, Length
+      - name: Build app
+        run: pyinstaller KirinukiTool.spec --noconfirm
+      - name: Self test (analyze, auto digest, captions, vertical render)
+        shell: pwsh
+        run: |
+          $p = Start-Process -PassThru -FilePath "dist\KirinukiTool\KirinukiTool.exe" -ArgumentList "--selftest","tests\sample.mp4","selftest_out"
+          if (-not $p.WaitForExit(1200000)) { Write-Error "selftest timed out"; exit 1 }
+          Get-Content selftest_out\selftest.log
+          if ((Get-Content selftest_out\selftest.log -TotalCount 1) -ne "OK") { exit 1 }
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $env:APP_VERSION = (Select-String -Path app.py -Pattern 'APP_VERSION = "([0-9.]+)"').Matches[0].Groups[1].Value
+          Write-Host "version $env:APP_VERSION"
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc installer\windows.iss
+      - name: Silent update test (same way the in-app updater runs it)
+        shell: pwsh
+        run: |
+          $p = Start-Process -PassThru -FilePath "installer_out\KirinukiTool-Setup-Windows.exe" -ArgumentList "/SILENT","/SUPPRESSMSGBOXES","/NORESTART","/CLOSEAPPLICATIONS"
+          if (-not $p.WaitForExit(600000)) { Write-Error "installer timed out"; exit 1 }
+          Start-Sleep -Seconds 10
+          $exe = Join-Path $env:LOCALAPPDATA "Programs\KirinukiTool\KirinukiTool.exe"
+          if (-not (Test-Path $exe)) { Write-Error "not installed: $exe"; exit 1 }
+          if (-not (Get-Process KirinukiTool -ErrorAction SilentlyContinue)) { Write-Error "app was not relaunched"; exit 1 }
+          Write-Host "installed and relaunched OK"
+          Stop-Process -Name KirinukiTool -Force
+      - name: Write version.txt
+        shell: pwsh
+        run: (Select-String -Path app.py -Pattern 'APP_VERSION = "([0-9.]+)"').Matches[0].Groups[1].Value | Out-File -Encoding ascii -NoNewline installer_out\version.txt
+      - name: Publish to "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: 最新版
+          prerelease: true
+          files: |
+            installer_out/KirinukiTool-Setup-Windows.exe
+            installer_out/version.txt
+          body: |
+            ## ダウンロード
+            **KirinukiTool-Setup-Windows.exe** を開いてインストールしてください。
+            2回目からはアプリが起動時に新しいバージョンを確認し、自動で更新できます。

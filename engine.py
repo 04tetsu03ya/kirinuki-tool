@@ -245,6 +245,20 @@ def _snap(t: float, cuts: list, lo: float, hi: float, tol: float = 1.0) -> float
     return best if best is not None else t
 
 
+def _quiet_point(loud: np.ndarray, step: float, t: float, lo: float, hi: float, tol: float = 1.0) -> float:
+    """t の近く（±tol秒）で一番静かな所。話の途中で切れないようにする"""
+    i0 = int(max(lo, t - tol) / step)
+    i1 = int(min(hi, t + tol) / step)
+    if i1 <= i0:
+        return t
+    seg = loud[i0:i1 + 1]
+    j = int(np.argmin(seg))
+    # 十分静かなときだけ動かす（周りより 6dB 以上小さい）
+    if seg[j] < np.median(seg) - 6:
+        return (i0 + j) * step
+    return t
+
+
 def auto_digest(an: dict, target: float, clip_len: float | None = None,
                 ranges: list | None = None, skip_edges: bool = True) -> list[Clip]:
     """
@@ -297,8 +311,11 @@ def auto_digest(an: dict, target: float, clip_len: float | None = None,
                     best_i, best_v = i, v
             s = best_i * step
         s = _snap(s, cuts, a, b - clip_len * 0.6)
-        e = min(b, s + clip_len)
-        clips.append(Clip(start=round(s, 2), end=round(e, 2), section=si))
+        loud = np.asarray(an["loud"], np.float32)
+        s2 = _quiet_point(loud, step, s, a, s + clip_len * 0.3)
+        e = min(b, s2 + clip_len)
+        e = _quiet_point(loud, step, e, s2 + clip_len * 0.7, min(b, s2 + clip_len * 1.4))
+        clips.append(Clip(start=round(s2, 2), end=round(min(e, dur), 2), section=si))
     return clips
 
 
